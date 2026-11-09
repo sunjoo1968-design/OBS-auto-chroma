@@ -1,0 +1,146 @@
+// 자동 크로마키(AC) 키어 셰이더 [27/33]
+// 베이스: obsproject/obs-studio 33.0.0 chroma_key_filter_v2.effect (docs/ref 사본과 diff 대조).
+// 알파 계산(고정 9샘플 박스 거리, fullMask)과 premultiply 처리는 원본 그대로.
+// 색 처리만 sim/hybrid_key.py 와 같음: 전역 spill 탈색 제거, G' = lerp(G, min(G, max(R,B)), despill_strength).
+// v0.2: despill_rotate >= 0.5 (키색이 녹색 우세가 아닐 때)면 sim/hybrid_key.py despill_key 의 회전 경로를 쓴다 -
+//   키색 색상을 녹색으로 돌리는 3x3 (행 rot_r/rot_g/rot_b)로 sRGB 값을 돌려 G 변화분만 원래 공간에 되돌린다. < 0.5 면 위 식 그대로.
+// contrast / brightness / gamma / spill 은 사용하지 않는다.
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float4 cb_v4 = { -0.100644, -0.338572,  0.439216, 0.501961 };
+uniform float4 cr_v4 = {  0.439216, -0.398942, -0.040274, 0.501961 };
+
+uniform float opacity;
+uniform float despill_strength;
+uniform float despill_rotate;
+uniform float3 rot_r;
+uniform float3 rot_g;
+uniform float3 rot_b;
+
+uniform float2 chroma_key;
+uniform float2 pixel_size;
+uniform float similarity;
+uniform float smoothness;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float GetChromaDist(float3 rgb)
+{
+	float cb = dot(rgb.rgb, cb_v4.xyz) + cb_v4.w;
+	float cr = dot(rgb.rgb, cr_v4.xyz) + cr_v4.w;
+	return distance(chroma_key, float2(cb, cr));
+}
+
+float GetNonlinearChannel(float u)
+{
+	return (u <= 0.0031308) ? (12.92 * u) : ((1.055 * pow(u, 1.0 / 2.4)) - 0.055);
+}
+
+float3 GetNonlinearColor(float3 rgb)
+{
+	return float3(GetNonlinearChannel(rgb.r), GetNonlinearChannel(rgb.g), GetNonlinearChannel(rgb.b));
+}
+
+float GetLinearChannel(float u)
+{
+	return (u <= 0.04045) ? (u / 12.92) : pow((u + 0.055) / 1.055, 2.4);
+}
+
+float3 GetLinearColor(float3 rgb)
+{
+	return float3(GetLinearChannel(rgb.r), GetLinearChannel(rgb.g), GetLinearChannel(rgb.b));
+}
+
+// 키 방향 despill (sim/hybrid_key.py despill_key): 입력은 선형 비프리멀티 색. 회전·G 제한은 sRGB 값에서 하고
+// 변화분(deltaG)이 없는 픽셀은 입력을 그대로 돌려준다(sRGB 왕복 오차 없음). 결과는 채널별 0~1 로 자른다.
+float3 DespillRotated(float3 linearRgb)
+{
+	float3 s = GetNonlinearColor(linearRgb);
+	float3 rotated = float3(dot(rot_r, s), dot(rot_g, s), dot(rot_b, s));
+	float deltaG = (min(rotated.g, max(rotated.r, rotated.b)) - rotated.g) * despill_strength;
+	if (deltaG == 0.0) {
+		return linearRgb;
+	}
+	float3 o = s + deltaG * rot_g;
+	return GetLinearColor(float3(saturate(o.r), saturate(o.g), saturate(o.b)));
+}
+
+float3 SampleTexture(float2 uv)
+{
+	float3 rgb = image.Sample(textureSampler, uv).rgb;
+	return GetNonlinearColor(rgb);
+}
+
+float GetBoxFilteredChromaDist(float3 rgb, float2 texCoord)
+{
+	float2 h_pixel_size = pixel_size / 2.0;
+	float2 point_0 = float2(pixel_size.x, h_pixel_size.y);
+	float2 point_1 = float2(h_pixel_size.x, -pixel_size.y);
+	float distVal = GetChromaDist(SampleTexture(texCoord-point_0));
+	distVal += GetChromaDist(SampleTexture(texCoord+point_0));
+	distVal += GetChromaDist(SampleTexture(texCoord-point_1));
+	distVal += GetChromaDist(SampleTexture(texCoord+point_1));
+	distVal *= 2.0;
+	distVal += GetChromaDist(GetNonlinearColor(rgb));
+	return distVal / 9.0;
+}
+
+float4 ProcessChromaKey(float4 rgba, VertData v_in)
+{
+	float chromaDist = GetBoxFilteredChromaDist(rgba.rgb, v_in.uv);
+	float baseMask = chromaDist - similarity;
+	float fullMask = pow(saturate(baseMask / smoothness), 1.5);
+
+	rgba.a *= opacity;
+	rgba.a *= fullMask;
+
+	if (despill_rotate >= 0.5) {
+		rgba.rgb = DespillRotated(rgba.rgb);
+		return rgba;
+	}
+
+	// despill 은 sim/hybrid_key.py 와 같은 sRGB(비선형) 공간에서 lerp 한다 (선형 공간 lerp 는 strength<1 에서 결과가 달라짐).
+	// strength=1 이면 min(G, max(R,B)) 가 단조라 공간과 무관하므로 왕복 변환 오차 없이 선형값에서 바로 계산한다(기존 결과 불변).
+	float limitVal = max(rgba.r, rgba.b);
+	float limited = min(rgba.g, limitVal);
+	float gMix = lerp(GetNonlinearChannel(rgba.g), GetNonlinearChannel(limited), despill_strength);
+	rgba.g = (despill_strength >= 1.0) ? limited : GetLinearChannel(gMix);
+
+	return rgba;
+}
+
+float4 PSChromaKeyRGBA(VertData v_in) : TARGET
+{
+	float4 rgba = image.Sample(textureSampler, v_in.uv);
+	rgba.rgb *= (rgba.a > 0.) ? (1. / rgba.a) : 0.;
+	rgba = ProcessChromaKey(rgba, v_in);
+	rgba.rgb *= rgba.a;
+	return rgba;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSChromaKeyRGBA(v_in);
+	}
+}

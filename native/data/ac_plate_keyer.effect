@@ -1,0 +1,289 @@
+// 배경판 지우기(AC) 셰이더 [PLAN-v0.2 D7, PLAN-v0.2.1 D9·D10]
+// 출처: 9샘플 박스 평균 구조·sRGB 처리·technique 틀은 obsproject/obs-studio 33.0.0 chroma_key_filter_v2.effect(GPLv2)에서 파생 — docs/license.md.
+// 식(a 밝기 왜곡·CD 색 왜곡·dc 색도 거리·same·alpha)과 D10 경계 색 되살리기(F̂·α_m·과보정 억제)의 정답: sim/plate_key.py, sim/plate_edge.py (설명은 각 파일 머리). 상수 uniform 은 모두 Lua(ac_plate_math)가 주입(SSOT).
+// [셰이더 편차] 둘레 8표본의 알파·CD 는 박스 평균이 아니라 그 표본 한 점(image 1 + plate 1 읽기)으로 계산한다(읽기 16개만 증가). 파이썬 정답은 둘레도 박스 평균. chroma(E)도 중심 표본 하나에서 읽는다.
+// technique: Draw(옵션 끔) / DrawCopy→DrawStraight→Veto (잡티 옵션, ac_plate_clean.lua 가 순서대로 그림). Veto = D12a 이웃 판 거부권 + D12c 큰 덩어리 보호, 정답 sim/plate_clean.py. 색 보정(despill)은 경계 밖에는 없다.
+// sRGB 규칙: 판 텍스처는 Lua 가 gs_effect_set_texture_srgb 로 올려 rgb = E 는 선형, a = σ*sigma_scale 은 그대로. 현재 프레임도 선형으로 받으므로(OBS_SOURCE_SRGB + GS_CS_SRGB) 비교는 선형 공간.
+// (식 전문·D9 same 게이트·D10 F̂/α_m 수식은 PLAN-v0.2.1 D9·D10 과 위 sim 파일 docstring 참조)
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d plate;
+uniform texture2d key_tex;   // technique Veto 전용: 직전 패스(DrawStraight) 결과. a = 원래 키 알파
+
+uniform float2 pixel_size;
+uniform float tau_cd;
+uniform float w_cd;
+uniform float tau_lo;
+uniform float tau_hi;
+uniform float w_a;
+// 아래 셋은 Lua(ac_plate_math)가 정답 상수를 주입한다(SSOT)
+uniform float sigma_floor;
+uniform float sigma_scale;
+uniform float ee_min;
+// D9 같은 색 방향 밝기 변화 = 배경
+uniform float same_enable;
+uniform float same_a_lo;
+uniform float same_a_hi;
+uniform float same_dc_max;
+uniform float same_dc_w;
+uniform float same_chroma_min;
+uniform float same_gate_w;
+uniform float chroma_sum_min;
+uniform float chroma_gray;
+// D10 경계 색 되살리기
+uniform float ring_px;
+uniform float edge_boundary_alpha;
+uniform float unmix_alpha_min;
+uniform float unmix_denom_min;
+uniform float edge_tie_eps;
+uniform float unmix_clamp;
+uniform float keep_alpha_max;  // D16: 판 알파 < 이 값(바이트 0)이면 원본 그대로 (판이 없는 자리 = 지우지 않음)
+// D12a·D12c 이웃 판 거부권 (technique Veto 만 쓴다. Lua ac_plate_clean 이 sim/constants_clean.py 값을 주입)
+uniform float veto_r;
+uniform float guard_k;
+uniform float guard_fg_alpha;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+// 색도 v/(r+g+b). 합이 거의 0이면 chroma_sum_min 으로 나눈다
+float3 Chromaticity(float3 v)
+{
+	return v / max(v.r + v.g + v.b, chroma_sum_min);
+}
+
+// (CD, a, dc). p = 그 위치의 판 샘플(rgb = E, a = σ*scale). E·E <= ee_min(거의 검정)이면 a = 1, CD = ‖I‖/σ (삼항 선택, 반복문 없음)
+float3 Distortion(float3 cur, float4 p)
+{
+	float sigma = max(p.a / sigma_scale, sigma_floor);
+	float ee = dot(p.rgb, p.rgb);
+	float dark = (ee <= ee_min) ? 1.0 : 0.0;
+	float a = lerp(dot(cur, p.rgb) / max(ee, ee_min), 1.0, dark);
+	float3 resid = cur - (1.0 - dark) * a * p.rgb;
+	float dc = length(Chromaticity(cur) - Chromaticity(p.rgb));
+	return float3(length(resid) / sigma, a, dc);
+}
+
+float3 SampleDistortion(float2 uv)
+{
+	return Distortion(image.Sample(textureSampler, uv).rgb, plate.Sample(textureSampler, uv));
+}
+
+float3 GetBoxFilteredDistortion(float3 center_rgb, float4 center_plate, float2 uv)
+{
+	float2 h_pixel_size = pixel_size / 2.0;
+	float2 point_0 = float2(pixel_size.x, h_pixel_size.y);
+	float2 point_1 = float2(h_pixel_size.x, -pixel_size.y);
+	float3 sum = SampleDistortion(uv - point_0);
+	sum += SampleDistortion(uv + point_0);
+	sum += SampleDistortion(uv - point_1);
+	sum += SampleDistortion(uv + point_1);
+	sum *= 2.0;
+	sum += Distortion(center_rgb, center_plate);
+	return sum / 9.0;
+}
+
+// 판 채도 ‖c(E) - 1/3‖ (판 픽셀 하나). D9 무채색 gate 입력
+float PlateChroma(float3 e)
+{
+	return length(Chromaticity(e) - chroma_gray);
+}
+
+// 전경 알파 = max(fg_cd, fg_dark, fg_bright) · (1 - same). d = (CD, a, dc)
+float KeyAlpha(float3 d, float chroma)
+{
+	float fg_cd = saturate((d.x - tau_cd) / w_cd);
+	float fg_dark = saturate((tau_lo - d.y) / w_a);
+	float fg_bright = saturate((d.y - tau_hi) / w_a);
+	float same = saturate((same_dc_max + same_dc_w - d.z) / same_dc_w)
+		* saturate((d.y - same_a_lo) / w_a)
+		* saturate((same_a_hi + w_a - d.y) / w_a)
+		* saturate((chroma - same_chroma_min) / same_gate_w);
+	return max(fg_cd, max(fg_dark, fg_bright)) * (1.0 - same_enable * same);
+}
+
+// D10 둘레 8표본 누적 상태
+struct Ring {
+	float min_a;     // 둘레 알파 최소
+	float s_fg;      // 알파 >= 경계 기준인 표본 중 최대 거리 점수(없으면 -1)
+	float3 c_fg;
+	float s_all;     // 전체 표본 중 최대 거리 점수
+	float3 c_all;
+};
+
+// 둘레 표본 한 점(uv + off*ring_px) 처리. 점수 = ‖I_q - E‖² + eps·CD_q (정답과 같은 동점 처리)
+Ring RingStep(Ring r, float2 uv, float2 off, float3 e_center)
+{
+	float2 q = uv + off * ring_px * pixel_size;
+	float4 iq4 = image.Sample(textureSampler, q);
+	float3 iq = iq4.rgb * ((iq4.a > 0.) ? (1. / iq4.a) : 0.);
+	float4 pq = plate.Sample(textureSampler, q);
+	float3 d = Distortion(iq, pq);
+	float aq = KeyAlpha(d, PlateChroma(pq.rgb));
+	float3 diff = iq - e_center;
+	float score = dot(diff, diff) + edge_tie_eps * d.x;
+	float take_all = (score > r.s_all) ? 1.0 : 0.0;
+	float take_fg = (aq >= edge_boundary_alpha && score > r.s_fg) ? 1.0 : 0.0;
+	Ring o;
+	o.min_a = min(r.min_a, aq);
+	o.s_all = lerp(r.s_all, score, take_all);
+	o.c_all = lerp(r.c_all, iq, take_all);
+	o.s_fg = lerp(r.s_fg, score, take_fg);
+	o.c_fg = lerp(r.c_fg, iq, take_fg);
+	return o;
+}
+
+// 키 + D10 경계 색 되살리기. 출력은 프리멀티 아닌 직선 RGBA (rgb = 되살린 색, a = 입력 알파 * 키 알파)
+float4 PlateKeyStraight(VertData v_in)
+{
+	float4 rgba = image.Sample(textureSampler, v_in.uv);
+	rgba.rgb *= (rgba.a > 0.) ? (1. / rgba.a) : 0.;
+	float4 pc = plate.Sample(textureSampler, v_in.uv);
+	float4 src = rgba;
+
+	float3 d = GetBoxFilteredDistortion(rgba.rgb, pc, v_in.uv);
+	float key = KeyAlpha(d, PlateChroma(pc.rgb));
+
+	// D10: 둘레 8표본(정답 sim/plate_edge.py 의 _RING_DIRECTIONS 순서)
+	Ring r;
+	r.min_a = 1.0;
+	r.s_fg = -1.0;
+	r.c_fg = float3(0., 0., 0.);
+	r.s_all = -1.0;
+	r.c_all = float3(0., 0., 0.);
+	r = RingStep(r, v_in.uv, float2(1., 0.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(-1., 0.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(0., 1.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(0., -1.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(1., 1.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(-1., 1.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(1., -1.), pc.rgb);
+	r = RingStep(r, v_in.uv, float2(-1., -1.), pc.rgb);
+
+	float3 f_hat = (r.s_fg >= 0.) ? r.c_fg : r.c_all;
+	float3 fe = f_hat - pc.rgb;
+	float alpha_m = saturate(dot(rgba.rgb - pc.rgb, fe) / max(dot(fe, fe), unmix_denom_min));
+	float3 unmixed = saturate((rgba.rgb - (1.0 - alpha_m) * pc.rgb) / max(alpha_m, unmix_alpha_min));
+	// 과보정 억제: 되살린 색을 채널별로 [min(I,F̂), max(I,F̂)] 안으로(unmix_clamp = 1). 추가 텍스처 읽기 없음
+	float3 clamped = clamp(unmixed, min(rgba.rgb, f_hat), max(rgba.rgb, f_hat));
+	unmixed = lerp(unmixed, clamped, unmix_clamp);
+	float is_edge = (key > 0. && r.min_a < edge_boundary_alpha) ? 1.0 : 0.0;
+
+	rgba.rgb = lerp(rgba.rgb, unmixed, is_edge);
+	rgba.a *= key;
+	return (pc.a < keep_alpha_max) ? src : rgba;
+}
+
+// 옵션 끔(기본) 경로: 직선 결과를 프리멀티해서 그린다 (v0.2.1 과 같은 식)
+float4 PSPlateKeyRGBA(VertData v_in) : TARGET
+{
+	float4 rgba = PlateKeyStraight(v_in);
+	rgba.rgb *= rgba.a;
+	return rgba;
+}
+
+// 옵션 켬 경로 1: 키 결과를 프리멀티 없이 중간 텍스처에 쓴다 (Lua 가 image 로 DrawCopy 결과를 연결)
+float4 PSPlateKeyStraight(VertData v_in) : TARGET
+{
+	return PlateKeyStraight(v_in);
+}
+
+// 옵션 켬 경로 0: 입력(필터 대상)을 그대로 중간 텍스처에 복사 — 거부권 패스가 원본 색을 다시 읽는다
+float4 PSCopy(VertData v_in) : TARGET
+{
+	return image.Sample(textureSampler, v_in.uv);
+}
+
+// D12a: 판을 (dx, dy)*veto_r px 옮긴 표본 한 점으로 계산한 키 알파 (정답 sim/plate_clean.veto_floor, 박스 평균 아님)
+float VetoSample(float3 cur, float2 uv, float2 shift_dir)
+{
+	float4 pq = plate.Sample(textureSampler, uv + shift_dir * veto_r * pixel_size);
+	return KeyAlpha(Distortion(cur, pq), PlateChroma(pq.rgb));
+}
+
+// D12c: key_tex 의 (px) 오프셋 한 점의 알파가 전경 문턱보다 크면 1
+float GuardHit(float2 uv, float2 px)
+{
+	return (key_tex.Sample(textureSampler, uv + px * pixel_size).a > guard_fg_alpha) ? 1.0 : 0.0;
+}
+
+// D12a+D12c 거부권: 둘레 원(반지름 40, 16점 = sim/constants_clean.iso_offsets(40, 16)) 전경 수 <= guard_k 일 때만
+// a' = min(a, 판 8방향 이동 표본 키 알파 최소). 색(rgb)은 key_tex 그대로.
+float4 PSVeto(VertData v_in) : TARGET
+{
+	float4 k = key_tex.Sample(textureSampler, v_in.uv);
+	float4 raw = image.Sample(textureSampler, v_in.uv);
+	float3 cur = raw.rgb * ((raw.a > 0.) ? (1. / raw.a) : 0.);
+	float low = 1.0;
+	// VETO_DIRS_BEGIN (sim/constants_clean.py CLEAN_VETO_DIRS 순서)
+	low = min(low, VetoSample(cur, v_in.uv, float2(1., 0.))); low = min(low, VetoSample(cur, v_in.uv, float2(-1., 0.)));
+	low = min(low, VetoSample(cur, v_in.uv, float2(0., 1.))); low = min(low, VetoSample(cur, v_in.uv, float2(0., -1.)));
+	low = min(low, VetoSample(cur, v_in.uv, float2(1., 1.))); low = min(low, VetoSample(cur, v_in.uv, float2(-1., 1.)));
+	low = min(low, VetoSample(cur, v_in.uv, float2(1., -1.))); low = min(low, VetoSample(cur, v_in.uv, float2(-1., -1.)));
+	// VETO_DIRS_END
+	float n = 0.0;
+	// GUARD_OFFSETS_BEGIN (sim/constants_clean.iso_offsets(CLEAN_GUARD_R, CLEAN_GUARD_N))
+	n += GuardHit(v_in.uv, float2(-40., 0.)); n += GuardHit(v_in.uv, float2(-37., -15.));
+	n += GuardHit(v_in.uv, float2(-37., 15.)); n += GuardHit(v_in.uv, float2(-28., -28.));
+	n += GuardHit(v_in.uv, float2(-28., 28.)); n += GuardHit(v_in.uv, float2(-15., -37.));
+	n += GuardHit(v_in.uv, float2(-15., 37.)); n += GuardHit(v_in.uv, float2(0., -40.));
+	n += GuardHit(v_in.uv, float2(0., 40.)); n += GuardHit(v_in.uv, float2(15., -37.));
+	n += GuardHit(v_in.uv, float2(15., 37.)); n += GuardHit(v_in.uv, float2(28., -28.));
+	n += GuardHit(v_in.uv, float2(28., 28.)); n += GuardHit(v_in.uv, float2(37., -15.));
+	n += GuardHit(v_in.uv, float2(37., 15.)); n += GuardHit(v_in.uv, float2(40., 0.));
+	// GUARD_OFFSETS_END
+	k.a = (n <= guard_k) ? min(k.a, low) : k.a;
+	return k;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPlateKeyRGBA(v_in);
+	}
+}
+
+technique DrawStraight
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPlateKeyStraight(v_in);
+	}
+}
+
+technique DrawCopy
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCopy(v_in);
+	}
+}
+
+technique Veto
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSVeto(v_in);
+	}
+}

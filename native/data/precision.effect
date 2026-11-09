@@ -1,0 +1,179 @@
+// OBS Auto Chroma 0.5.0-dev — SunjooAn. GPL-2.0-or-later.
+// Independent bounded multi-sample keyer; legacy v0.3 effects are unchanged.
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 key_colors[32];
+uniform float4 key_rects[32];
+uniform float4 key_flags[32];
+uniform float key_count;
+uniform float tolerance;
+uniform float softness;
+uniform float feather;
+uniform float edge_strength;
+uniform float despill_strength;
+uniform float opacity;
+uniform float2 pixel_size;
+uniform float4 region_vertices[2048];
+#include "region-shape.effectinc"
+
+sampler_state linearSampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
+VertData VSDefault(VertData v)
+{
+    VertData o; o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj); o.uv = v.uv; return o;
+}
+float Nonlinear(float u)
+{
+    u = max(u, 0.0);
+    return u <= 0.0031308 ? 12.92 * u : 1.055 * pow(u, 1.0 / 2.4) - 0.055;
+}
+float Linear(float u)
+{
+    u = saturate(u);
+    return u <= 0.04045 ? u / 12.92 : pow((u + 0.055) / 1.055, 2.4);
+}
+float3 ToNonlinear(float3 c) { return float3(Nonlinear(c.r), Nonlinear(c.g), Nonlinear(c.b)); }
+float3 ToLinear(float3 c) { return float3(Linear(c.r), Linear(c.g), Linear(c.b)); }
+float2 Chroma(float3 c)
+{
+    return float2(dot(c, float3(-0.100644, -0.338572, 0.439216)),
+                  dot(c, float3(0.439216, -0.398942, -0.040274)));
+}
+float Scope(float2 uv, float4 rect, float4 flags)
+{
+    if (flags.y < 0.5) return 1.0;
+    float2 d = min(uv - rect.xy, rect.xy + rect.zw - uv);
+    if (d.x < 0.0 || d.y < 0.0) return 0.0;
+    float width = min(feather, min(rect.z, rect.w) * 0.5);
+    if (flags.w >= 3.0) return PolygonWeight(uv, int(flags.z), int(flags.w), width);
+    // A correction touching the image border must reach that border fully;
+    // feather only boundaries that separate the ROI from other image pixels.
+    float left = rect.x <= 0.000001 ? 1.0 : uv.x - rect.x;
+    float top = rect.y <= 0.000001 ? 1.0 : uv.y - rect.y;
+    float right = rect.x + rect.z >= 0.999999 ? 1.0 : rect.x + rect.z - uv.x;
+    float bottom = rect.y + rect.w >= 0.999999 ? 1.0 : rect.y + rect.w - uv.y;
+    float insideDistance = min(min(left, right), min(top, bottom));
+    return width > 0.000001 ? saturate(insideDistance / width) : 1.0;
+}
+float KeyAlpha(float3 color, float2 chroma, float3 key)
+{
+    float d = distance(chroma, Chroma(key));
+    // A small luminance term distinguishes neutral foreground from the screen.
+    float luma = abs(dot(color - key, float3(0.2126, 0.7152, 0.0722)));
+    d = sqrt(d * d + luma * luma * 0.01);
+    return pow(saturate((d - tolerance) / max(softness, 0.0001)), 1.5);
+}
+float3 ReadStraight(float2 uv)
+{
+    float4 c = image.Sample(linearSampler, uv);
+    return ToNonlinear(c.a > 0.000001 ? c.rgb / c.a : float3(0.0, 0.0, 0.0));
+}
+float4 PSPrecision(VertData v) : TARGET
+{
+    float4 raw = image.Sample(linearSampler, v.uv);
+    float3 color = ToNonlinear(raw.a > 0.000001 ? raw.rgb / raw.a : float3(0.0, 0.0, 0.0));
+    float scopes[32];
+    int lastOutline = -1;
+    float lastWeight = 0.0;
+    for (int i = 0; i < 32; ++i) {
+        if (float(i) >= key_count) break;
+        float4 flags = key_flags[i];
+        if (flags.w < 3.0) {
+            scopes[i] = Scope(v.uv, key_rects[i], flags);
+        } else {
+            int outline = int(flags.z);
+            // Representatives of one stroke all share its outline and feather.
+            if (outline != lastOutline) {
+                lastOutline = outline;
+                lastWeight = Scope(v.uv, key_rects[i], flags);
+            }
+            scopes[i] = lastWeight;
+        }
+    }
+    // Use original color to guide a small edge-only matte smoothing, never erosion.
+    float alpha = 1.0;
+    float neighbor = 0.0;
+    float neighborWeight = 0.0;
+    float minAlpha = 1.0;
+    float maxAlpha = 0.0;
+    for (int j = 0; j < 5; ++j) {
+        float3 sampleColor = color;
+        if (j > 0) {
+            float2 offset = j == 1 ? float2(1.0, 0.0) : (j == 2 ? float2(-1.0, 0.0) :
+                            (j == 3 ? float2(0.0, 1.0) : float2(0.0, -1.0)));
+            sampleColor = ReadStraight(v.uv + pixel_size * offset);
+        }
+        float2 chroma = Chroma(sampleColor);
+        float coverage = 1.0;
+        float keep = 0.0;
+        for (int k = 0; k < 32; ++k) {
+            if (float(k) >= key_count) break;
+            // Neighbor samples share the output pixel's scope, preventing mask bleed.
+            float scope = scopes[k];
+            if (scope <= 0.0) continue;
+            float a = KeyAlpha(sampleColor, chroma, key_colors[k].rgb);
+            if (key_flags[k].x > 0.5) keep = max(keep, (1.0 - a) * scope);
+            else coverage = min(coverage, lerp(1.0, a, scope));
+        }
+        float result = max(coverage, keep);
+        if (j == 0) {
+            alpha = result;
+        } else {
+            float weight = exp(-dot(sampleColor - color, sampleColor - color) * 80.0);
+            neighbor += result * weight;
+            neighborWeight += weight;
+        }
+        minAlpha = min(minAlpha, result);
+        maxAlpha = max(maxAlpha, result);
+    }
+    alpha = lerp(alpha, (alpha + neighbor) / (1.0 + neighborWeight), edge_strength * 0.2);
+    float edge = saturate((maxAlpha - minAlpha) * 3.0 + 4.0 * alpha * (1.0 - alpha));
+    float best = 1000.0;
+    float exclusion = 0.0;
+    float3 screen = key_colors[0].rgb;
+    for (int k = 0; k < 32; ++k) {
+        if (float(k) >= key_count) break;
+        float scope = scopes[k];
+        if (scope <= 0.0) continue;
+        float d = distance(Chroma(color), Chroma(key_colors[k].rgb));
+        if (key_flags[k].x > 0.5) {
+            float luma = abs(dot(color - key_colors[k].rgb, float3(0.2126, 0.7152, 0.0722)));
+            float distValue = sqrt(d * d + luma * luma * 0.01);
+            float a = pow(saturate((distValue - tolerance) / max(softness, 0.0001)), 1.5);
+            exclusion = max(exclusion, (1.0 - a) * scope);
+            continue;
+        }
+        if (d < best) { best = d; screen = key_colors[k].rgb; }
+    }
+    // Correct spill separately from coverage. Near an edge, limiting toward the
+    // other channels' mean removes yellow-green fringes a max-channel clamp leaves.
+    float3 corrected = color;
+    float amount = 0.0;
+    if (screen.g > max(screen.r, screen.b) + 0.04) {
+        float limit = lerp(max(color.r, color.b), (color.r + color.b) * 0.5, edge * edge_strength);
+        amount = max(0.0, color.g - limit) * despill_strength * (1.0 - exclusion);
+        corrected.g -= amount;
+    } else if (screen.b > max(screen.r, screen.g) + 0.04) {
+        float limit = lerp(max(color.r, color.g), (color.r + color.g) * 0.5, edge * edge_strength);
+        amount = max(0.0, color.b - limit) * despill_strength * (1.0 - exclusion);
+        corrected.b -= amount;
+    } else if (screen.r > max(screen.g, screen.b) + 0.04) {
+        float limit = lerp(max(color.g, color.b), (color.g + color.b) * 0.5, edge * edge_strength);
+        amount = max(0.0, color.r - limit) * despill_strength * (1.0 - exclusion);
+        corrected.r -= amount;
+    }
+    // Bounded neutral compensation preserves brightness without changing alpha.
+    float before = dot(ToLinear(color), float3(0.2126, 0.7152, 0.0722));
+    float3 linearColor = ToLinear(corrected);
+    float after = dot(linearColor, float3(0.2126, 0.7152, 0.0722));
+    linearColor = saturate(linearColor + min(max(0.0, before - after), 0.15) * edge_strength);
+    float a = alpha * raw.a * opacity;
+    return float4(linearColor * a, a);
+}
+technique Draw {
+    pass { vertex_shader = VSDefault(v); pixel_shader = PSPrecision(v); }
+}

@@ -1,0 +1,74 @@
+// OBS Auto Chroma 0.4.0-dev — SunjooAn. GPL-2.0-or-later.
+// Independent final mask and preview conversion; legacy keyer shaders stay unchanged.
+// All input textures contain premultiplied linear RGB. Preview output is straight sRGB RGBA8.
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d original;
+uniform float4 protect_rect;
+uniform float4 erase_rect;
+uniform float protect_count;
+uniform float erase_count;
+uniform float4 region_vertices[256];
+#include "region-shape.effectinc"
+
+sampler_state linearSampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v)
+{
+    VertData o;
+    o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+    o.uv = v.uv;
+    return o;
+}
+
+bool InRect(float2 uv, float4 rect)
+{
+    return rect.z > 0.0 && rect.w > 0.0 && uv.x >= rect.x && uv.y >= rect.y
+        && uv.x < rect.x + rect.z && uv.y < rect.y + rect.w;
+}
+
+float4 PSCopy(VertData v) : TARGET
+{
+    return image.Sample(linearSampler, v.uv);
+}
+
+float4 PSMask(VertData v) : TARGET
+{
+    if (InRect(v.uv, protect_rect) && (protect_count < 3.0 || PolygonWeight(v.uv, 0, int(protect_count), 0.0) > 0.5))
+        return original.Sample(linearSampler, v.uv);
+    if (InRect(v.uv, erase_rect) && (erase_count < 3.0 || PolygonWeight(v.uv, 128, int(erase_count), 0.0) > 0.5))
+        return float4(0.0, 0.0, 0.0, 0.0);
+    return image.Sample(linearSampler, v.uv);
+}
+
+float Nonlinear(float u)
+{
+    u = max(u, 0.0);
+    return u <= 0.0031308 ? 12.92 * u : 1.055 * pow(u, 1.0 / 2.4) - 0.055;
+}
+
+float4 PSEncode(VertData v) : TARGET
+{
+    float4 p = image.Sample(linearSampler, v.uv);
+    float3 s = p.a > 0.0 ? p.rgb / p.a : float3(0.0, 0.0, 0.0);
+    return float4(saturate(float3(Nonlinear(s.r), Nonlinear(s.g), Nonlinear(s.b))), saturate(p.a));
+}
+
+technique Draw {
+    pass { vertex_shader = VSDefault(v); pixel_shader = PSCopy(v); }
+}
+technique Mask {
+    pass { vertex_shader = VSDefault(v); pixel_shader = PSMask(v); }
+}
+technique Encode {
+    pass { vertex_shader = VSDefault(v); pixel_shader = PSEncode(v); }
+}

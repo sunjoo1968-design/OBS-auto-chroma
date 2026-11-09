@@ -1,0 +1,29 @@
+// SunjooAn. Polygon coverage in original source UV coordinates.
+float PolygonWeight(float2 uv, int first, int count, float featherWidth)
+{
+    if (count < 3) return 1.0;
+    bool inside = false;
+    float nearest = 2.0;
+    float2 a = region_vertices[first + count - 1].xy;
+    for (int i = 0; i < count; ++i) {
+        float2 b = region_vertices[first + i].xy;
+        if ((a.y > uv.y) != (b.y > uv.y)) {
+            float crossing = a.x + (uv.y - a.y) * (b.x - a.x) / (b.y - a.y);
+            if (uv.x < crossing) inside = !inside;
+        }
+        if (featherWidth > 0.000001) {
+            // Edges on the actual frame border have no pixels to fade into.
+            bool frameEdge = max(a.x, b.x) < 0.000001 || max(a.y, b.y) < 0.000001 ||
+                             min(a.x, b.x) > 0.999999 || min(a.y, b.y) > 0.999999;
+            if (!frameEdge) {
+                float2 edge = b - a;
+                float t = saturate(dot(uv - a, edge) / max(dot(edge, edge), 0.000000000001));
+                float2 delta = uv - a - edge * t;
+                nearest = min(nearest, dot(delta, delta));
+            }
+        }
+        a = b;
+    }
+    if (!inside) return 0.0;
+    return featherWidth > 0.000001 ? saturate(sqrt(nearest) / featherWidth) : 1.0;
+}

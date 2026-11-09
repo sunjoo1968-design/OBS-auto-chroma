@@ -1,0 +1,9 @@
+.deps/
+.build/
+.runtime/
+.analysis/
+build/
+dist/
+/샘플/
+*.user
+*.pdb

@@ -1,0 +1,117 @@
+// 배경판 지우기 마무리 패스(AC) [PLAN-v0.2.2 D12b·D13] — 정답 원본: sim/plate_clean.py (isolate_specks, hair_despill)
+// 입력 image = 직전 패스 결과(RGBA16F, 프리멀티 아님. rgb = 선형 색, a = 거부권까지 적용된 알파). plate = 배경판(set_texture_srgb, rgb = E 선형).
+// 순서(파이썬과 같음): (머리) 머리카락 디스필 → (잡티) 고립 점 지우기 → 프리멀티. 머리 게이트는 고립 점 지우기 이전 알파를 본다.
+// D13 머리카락: gate = lum(I) < hair_lum_max ∧ 판 채도 ‖E-lum E‖/lum E > hair_plate_sat_min ∧ a > 0 ∧ (둘레 hair_ring_px 8방향 알파 최소 < hair_boundary_alpha)
+//   ê = (E-lum E)/‖E-lum E‖,  p = max((I-lum I)·ê, 0),  I' = max(I - k·p·ê, 0) (gate 일 때만). 알파는 건드리지 않는다.
+// D12b 고립 점 지우기: 둘레 원(반지름 14, 16점 = sim/constants_clean.iso_offsets(14, 16), 손으로 펼침) 최대 알파 < iso_t 이면 a = 0.
+// 분기 조건 hair_on·despeck_on 은 uniform 이라 모든 픽셀이 같은 쪽으로 간다. 화면 밖은 Clamp(정답 _shifted 와 같음). 반복문 없음.
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d plate;
+
+uniform float2 pixel_size;
+uniform float hair_on;
+uniform float despeck_on;
+uniform float iso_t;
+uniform float hair_k;
+uniform float hair_lum_max;
+uniform float hair_plate_sat_min;
+uniform float hair_ring_px;
+uniform float hair_boundary_alpha;
+uniform float lum_eps;
+uniform float3 hair_lum_w;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+// uv 에서 px 만큼 떨어진 점의 알파
+float AlphaAt(float2 uv, float2 px)
+{
+	return image.Sample(textureSampler, uv + px * pixel_size).a;
+}
+
+// 둘레 hair_ring_px 8방향(정답 CLEAN_VETO_DIRS 순서) 알파 최소
+float RingMinAlpha(float2 uv)
+{
+	float m = AlphaAt(uv, float2(hair_ring_px, 0.));
+	m = min(m, AlphaAt(uv, float2(-hair_ring_px, 0.)));
+	m = min(m, AlphaAt(uv, float2(0., hair_ring_px)));
+	m = min(m, AlphaAt(uv, float2(0., -hair_ring_px)));
+	m = min(m, AlphaAt(uv, float2(hair_ring_px, hair_ring_px)));
+	m = min(m, AlphaAt(uv, float2(-hair_ring_px, hair_ring_px)));
+	m = min(m, AlphaAt(uv, float2(hair_ring_px, -hair_ring_px)));
+	m = min(m, AlphaAt(uv, float2(-hair_ring_px, -hair_ring_px)));
+	return m;
+}
+
+// D13: 머리카락 디스필. 색만 돌려준다
+float3 HairDespill(float4 c, float2 uv)
+{
+	float3 e = plate.Sample(textureSampler, uv).rgb;
+	float lum_e = dot(e, hair_lum_w);
+	float3 diff = e - lum_e;
+	float norm = length(diff);
+	float3 hue = diff / max(norm, lum_eps);
+	float lum_i = dot(c.rgb, hair_lum_w);
+	float push = max(dot(c.rgb - lum_i, hue), 0.);
+	float gate = (lum_i < hair_lum_max && norm / max(lum_e, lum_eps) > hair_plate_sat_min
+		&& c.a > 0. && RingMinAlpha(uv) < hair_boundary_alpha) ? 1.0 : 0.0;
+	float3 changed = max(c.rgb - hair_k * push * hue, 0.);
+	return lerp(c.rgb, changed, gate);
+}
+
+// 둘레 원 16점(iso_offsets(14, 16)) 최대 알파
+float IsoRingMax(float2 uv)
+{
+	float m = 0.0;
+	// ISO_OFFSETS_BEGIN (sim/constants_clean.iso_offsets(CLEAN_ISO_R, CLEAN_ISO_N))
+	m = max(m, AlphaAt(uv, float2(-14., 0.))); m = max(m, AlphaAt(uv, float2(-13., -5.)));
+	m = max(m, AlphaAt(uv, float2(-13., 5.))); m = max(m, AlphaAt(uv, float2(-10., -10.)));
+	m = max(m, AlphaAt(uv, float2(-10., 10.))); m = max(m, AlphaAt(uv, float2(-5., -13.)));
+	m = max(m, AlphaAt(uv, float2(-5., 13.))); m = max(m, AlphaAt(uv, float2(0., -14.)));
+	m = max(m, AlphaAt(uv, float2(0., 14.))); m = max(m, AlphaAt(uv, float2(5., -13.)));
+	m = max(m, AlphaAt(uv, float2(5., 13.))); m = max(m, AlphaAt(uv, float2(10., -10.)));
+	m = max(m, AlphaAt(uv, float2(10., 10.))); m = max(m, AlphaAt(uv, float2(13., -5.)));
+	m = max(m, AlphaAt(uv, float2(13., 5.))); m = max(m, AlphaAt(uv, float2(14., 0.)));
+	// ISO_OFFSETS_END
+	return m;
+}
+
+float4 PSPlateClean(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+	float3 rgb = c.rgb;
+	float a = c.a;
+	if (hair_on > 0.5) {
+		rgb = HairDespill(c, v_in.uv);
+	}
+	if (despeck_on > 0.5) {
+		a = (IsoRingMax(v_in.uv) < iso_t) ? 0.0 : a;
+	}
+	return float4(rgb * a, a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPlateClean(v_in);
+	}
+}
