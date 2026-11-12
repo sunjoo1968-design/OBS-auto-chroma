@@ -20,6 +20,7 @@ namespace ac {
 namespace {
 struct Config {
     std::string method = "passthrough", platePath, plateKind = "auto";
+    std::string request;
     uint32_t keyColor = 0x00ff00;
     float similarity = .4f, smoothness = .08f, opacity = 1, despill = 1, rotate = 0;
     std::array<float, 9> rotation{1, 0, 0, 0, 1, 0, 0, 0, 1};
@@ -35,7 +36,9 @@ struct Shared {
     Config config;
     std::optional<Config> previewConfig;
     Preview preview;
+    std::string currentError;
     std::atomic_bool capture{false};
+    std::atomic_bool liveCapture{false};
     std::atomic<uint64_t> epoch{1};
 };
 
@@ -51,6 +54,7 @@ struct Renderer {
 struct Stage {
     gs_stagesurf_t *original = nullptr, *processed = nullptr;
     uint64_t timestamp = 0;
+    std::string error;
 };
 
 struct Filter {
@@ -94,6 +98,7 @@ Config readConfig(obs_data_t *s)
 {
     Config c;
     c.method = obs_data_get_string(s, "method");
+    c.request = obs_data_get_string(s, "ac_request_id");
     c.platePath = obs_data_get_string(s, "plate_path");
     c.plateKind = obs_data_get_string(s, "plate_kind");
     c.despeck = obs_data_get_bool(s, "despeck") && c.plateKind == "manual";
@@ -300,7 +305,7 @@ void publishError(Filter *f, const std::string &error)
 {
     {
         std::lock_guard lock(f->shared->mutex);
-        f->shared->preview.error = error;
+        f->shared->currentError = error;
     }
     if (error != f->loggedError) {
         if (!error.empty()) blog(LOG_WARNING, "[auto-chroma] %s", error.c_str());
@@ -430,19 +435,26 @@ bool stageTexture(Filter *f, gs_stagesurf_t *&stage, gs_texture_t *texture)
     return true;
 }
 
+bool captureDue(const Filter *f, uint64_t interval)
+{
+    const auto timestamp = obs_get_video_frame_time();
+    return timestamp && (!f->lastCapture ||
+        (timestamp != f->lastCapture && (timestamp < f->lastCapture || timestamp - f->lastCapture >= interval)));
+}
+
 void capturePreview(Filter *f, gs_texture_t *raw, gs_texture_t *processed, const std::string &error,
-                    uint64_t epoch)
+                    uint64_t epoch, const std::string &request)
 {
     if (epoch != f->shared->epoch.load()) return;
     if (f->stageEpoch != epoch) { clearStages(f); f->stageEpoch = epoch; }
     const auto timestamp = obs_get_video_frame_time();
     if (timestamp == 0 || timestamp == f->lastCapture) return;
-    // At most 30 preview frames/second. The timestamp identifies OBS output, not sensor frames.
-    if (f->lastCapture && timestamp > f->lastCapture && timestamp - f->lastCapture < 33333333) return;
     auto &previous = f->stages[1 - f->nextStage];
     if (previous.timestamp) {
         Preview preview;
-        preview.error = error;
+        preview.error = previous.error;
+        preview.revision = epoch;
+        preview.appliedRequest = request;
         const bool ok = mapFrame(previous.original, f->width, f->height, previous.timestamp, preview.original)
             && mapFrame(previous.processed, f->width, f->height, previous.timestamp, preview.processed);
         previous.timestamp = 0;
@@ -455,6 +467,7 @@ void capturePreview(Filter *f, gs_texture_t *raw, gs_texture_t *processed, const
     }
     auto &next = f->stages[f->nextStage];
     if (stageTexture(f, next.original, raw) && stageTexture(f, next.processed, processed)) {
+        next.error = error;
         next.timestamp = timestamp;
         f->lastCapture = timestamp;
         f->nextStage = 1 - f->nextStage;
@@ -553,15 +566,18 @@ void render(void *data, gs_effect_t *)
     auto *output = process(f, f->live, config, raw, liveError);
     gs_texture_t *preview = output;
     std::string previewError = liveError;
-    if (capture && previewConfig) preview = process(f, f->candidate, *previewConfig, raw, previewError);
+    const uint64_t interval = f->shared->liveCapture.load() ? 100000000 : 33333333;
+    const bool sample = capture && captureDue(f, interval);
+    if (sample && previewConfig) preview = process(f, f->candidate, *previewConfig, raw, previewError);
     // Draw only committed settings. Candidate settings never enter the broadcast output.
     gs_enable_framebuffer_srgb(true);
     gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
     setTexture(f->maskEffect, "image", output);
     draw(f->maskEffect, "Draw", output, w, h);
-    publishError(f, capture ? previewError : (liveError.empty() ? captureLimitError : liveError));
-    if (capture) {
-        try { capturePreview(f, raw, preview, previewError, epoch); }
+    if (sample || !previewConfig || !liveError.empty())
+        publishError(f, capture ? previewError : (liveError.empty() ? captureLimitError : liveError));
+    if (sample) {
+        try { capturePreview(f, raw, preview, previewError, epoch, config.request); }
         catch (const std::exception &) { publishError(f, "미리보기 메모리를 확보하지 못했습니다."); }
     }
 }
@@ -573,6 +589,7 @@ void update(void *data, obs_data_t *settings)
     std::lock_guard lock(f->shared->mutex);
     f->shared->config = std::move(config);
     f->shared->preview = {};
+    f->shared->currentError.clear();
     f->shared->epoch.fetch_add(1);
 }
 
@@ -719,19 +736,21 @@ void registerFilter()
     obs_register_source(&info);
 }
 
-void requestCapture(obs_source_t *filter, bool enabled)
+void requestCapture(obs_source_t *filter, bool enabled, bool live)
 {
     if (auto state = stateFor(filter)) {
+        state->liveCapture.store(live);
         const bool previous = state->capture.exchange(enabled);
         if (previous != enabled) {
             std::lock_guard lock(state->mutex);
             state->preview = {};
+            state->currentError.clear();
             state->epoch.fetch_add(1);
         }
     }
 }
 
-void setPreviewSettings(obs_source_t *filter, obs_data_t *settings)
+uint64_t setPreviewSettings(obs_source_t *filter, obs_data_t *settings)
 {
     if (auto state = stateFor(filter)) {
         std::optional<Config> config;
@@ -746,18 +765,43 @@ void setPreviewSettings(obs_source_t *filter, obs_data_t *settings)
         std::lock_guard lock(state->mutex);
         state->previewConfig = std::move(config);
         state->preview = {};
-        state->epoch.fetch_add(1);
+        state->currentError.clear();
+        return state->epoch.fetch_add(1) + 1;
     }
+    return 0;
 }
 
 Preview readPreview(obs_source_t *filter)
 {
     if (auto state = stateFor(filter)) {
         std::lock_guard lock(state->mutex);
-        return state->preview;
+        auto preview = state->preview;
+        if (!state->currentError.empty()) preview.error = state->currentError;
+        return preview;
     }
     Preview p;
     p.error = "자동 크로마키 필터가 없거나 해제되었습니다.";
     return p;
+}
+
+std::string appliedRequest(obs_source_t *filter)
+{
+    if (auto state = stateFor(filter)) {
+        std::lock_guard lock(state->mutex);
+        return state->config.request;
+    }
+    return {};
+}
+
+bool previewVerified(obs_source_t *filter, uint64_t revision)
+{
+    if (auto state = stateFor(filter)) {
+        std::lock_guard lock(state->mutex);
+        const auto &preview = state->preview;
+        return revision && state->previewConfig && revision == state->epoch.load() &&
+            preview.revision == revision && preview.original.valid() && preview.processed.valid() &&
+            preview.error.empty() && state->currentError.empty();
+    }
+    return false;
 }
 } // namespace ac

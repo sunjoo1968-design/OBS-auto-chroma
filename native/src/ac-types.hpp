@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace ac {
-inline constexpr const char *Version = "1.3";
+inline constexpr const char *Version = "1.4";
 inline constexpr const char *Author = "SunjooAn";
 inline constexpr const char *FilterId = "sunjoo_auto_chroma";
 struct Frame {
@@ -29,6 +29,8 @@ struct AnalysisResult {
 struct Preview {
     Frame original, processed;
     std::string error;
+    uint64_t revision = 0;
+    std::string appliedRequest;
 };
 using CancelFlag = std::shared_ptr<std::atomic_bool>;
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(sunjoo-auto-chroma VERSION 1.3.0 LANGUAGES C CXX)
+project(sunjoo-auto-chroma VERSION 1.4.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(AC_OBS_MAJOR "33" CACHE STRING "OBS target: 32 or 33")

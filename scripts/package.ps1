@@ -28,7 +28,7 @@ foreach ($taskMajor in $ObsMajor) {
             "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $taskRelative
         }
     $taskEntries | Set-Content -LiteralPath (Join-Path $taskStage 'SHA256SUMS.txt') -Encoding ascii
-    $taskZip = Join-Path $taskDist "OBS-auto-chroma-v1.3-obs$taskMajor-win64.zip"
+    $taskZip = Join-Path $taskDist "OBS-auto-chroma-v1.4-obs$taskMajor-win64.zip"
     # Use standard ZIP '/' separators, including when packaged from Windows PowerShell 5.1.
     $taskZipStream = [System.IO.File]::Open($taskZip, [System.IO.FileMode]::Create)
     $taskArchive = [System.IO.Compression.ZipArchive]::new($taskZipStream, [System.IO.Compression.ZipArchiveMode]::Create)
@@ -41,7 +41,7 @@ foreach ($taskMajor in $ObsMajor) {
             try { $taskInput.CopyTo($taskOutput) } finally { $taskOutput.Dispose(); $taskInput.Dispose() }
         }
     } finally { $taskArchive.Dispose(); $taskZipStream.Dispose() }
-    Write-Output "Packaged SunjooAn v1.3 OBS $taskMajor : $taskZip"
+    Write-Output "Packaged SunjooAn v1.4 OBS $taskMajor : $taskZip"
     & (Join-Path $PSScriptRoot 'verify-package.ps1') -ZipPath $taskZip
 }
 Get-ChildItem -LiteralPath $taskDist -Filter '*.zip' -File | Get-FileHash -Algorithm SHA256 |

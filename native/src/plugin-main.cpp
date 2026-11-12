@@ -10,7 +10,7 @@ MODULE_EXPORT const char *obs_module_name(void) { return "자동 크로마키"; 
 MODULE_EXPORT const char *obs_module_author(void) { return ac::Author; }
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "GPU chroma key, stroke precision keyer and clean plate filter with an OBS dock. SunjooAn 1.3";
+    return "GPU chroma key, stroke precision keyer and clean plate filter with an OBS dock. SunjooAn 1.4";
 }
 bool obs_module_load(void)
 {

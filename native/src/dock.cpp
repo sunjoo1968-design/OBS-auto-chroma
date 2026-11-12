@@ -53,6 +53,7 @@
 
 namespace ac {
 namespace {
+enum class Change { None, Reset, LiveApply, LiveRestore };
 constexpr const char *DockId = "sunjoo-auto-chroma-dock";
 QString utf8(const char *s) { return QString::fromUtf8(s ? s : ""); }
 bool isLive() { return obs_frontend_streaming_active() || obs_frontend_recording_active(); }
@@ -131,8 +132,14 @@ private:
     void cancel(bool reload = true);
     void finish();
     void apply();
-    void revert(bool reset = false);
+    void revert();
     void reset();
+    bool restoreKeyers(const QJsonObject &settings);
+    bool liveEditing() const;
+    void updateLiveCandidate();
+    void applyLive();
+    void beginChange(Change change, QJsonObject settings, bool replace);
+    void checkChange(const Preview &preview);
     void loadControls();
     void updateRegions();
     void updateCandidate();
@@ -178,6 +185,13 @@ private:
     CancelFlag cancelFlag_;
     AnalysisResult pending_;
     QString pendingPlate_;
+    Change change_ = Change::None;
+    QString changeRequest_;
+    QElapsedTimer changeTimer_;
+    QJsonObject changeExpected_;
+    bool resetMissingKeyers_ = false;
+    uint64_t livePreviewRevision_ = 0;
+    QJsonObject liveBase_, liveCandidate_, liveUndo_, liveApplied_;
     Rect analysis_ {0, 0, 1, 1};
     Region protect_, erase_, local_;
     uint64_t lastStamp_ = 0;
@@ -527,6 +541,10 @@ void Dock::refreshSources()
 }
 void Dock::detach()
 {
+    change_ = Change::None; changeRequest_.clear();
+    changeExpected_ = {};
+    livePreviewRevision_ = 0; liveBase_ = {}; liveCandidate_ = {};
+    liveUndo_ = {}; liveApplied_ = {};
     preview_->cancelInteraction(); strokes_ = {}; strokeHistory_.clear(); updateStrokeList();
     ++generation_; collecting_ = false; ready_ = false; frames_.clear();
     if (!pendingPlate_.isEmpty()) QFile::remove(pendingPlate_);
@@ -675,13 +693,15 @@ void Dock::cancel(bool reload)
     ++generation_;
     if (cancelFlag_) cancelFlag_->store(true);
     collecting_ = false; ready_ = false; frames_.clear();
+    pending_ = {};
+    livePreviewRevision_ = 0; liveBase_ = {}; liveCandidate_ = {};
     if (!pendingPlate_.isEmpty()) QFile::remove(pendingPlate_);
     pendingPlate_.clear();
     if (filter_) setPreviewSettings(filter_, nullptr);
     preview_->cancelInteraction();
     if (reload && filter_) loadControls();
     progress_->setRange(0, 100); progress_->setValue(0);
-    status(analyzing_ ? QStringLiteral("취소 처리 중… 계산이 멈추면 다시 실행할 수 있습니다.") : QStringLiteral("취소했습니다. 적용된 설정은 유지됩니다."));
+    status(analyzing_ ? QStringLiteral("분석 취소를 요청했습니다. 계산이 끝나면 다시 시작할 수 있습니다.") : QStringLiteral("취소했습니다. 적용된 설정은 유지됩니다."));
     updateButtons();
 }
 void Dock::tick()
@@ -693,18 +713,24 @@ void Dock::tick()
     if (uint64_t(obs_source_get_base_width(source_)) * obs_source_get_base_height(source_) > 3840ULL * 2160ULL) {
         if (collecting_ || analyzing_ || ready_) cancel();
         requestCapture(filter_, false); driver_.setSource(nullptr);
+        if (change_ != Change::None) { checkChange({}); return; }
         status(QStringLiteral("미리보기는 최대 4K 픽셀 수까지 지원합니다. 소스 해상도를 낮춰 주세요.")); return;
     }
     if (!obs_source_enabled(filter_)) {
+        if (change_ != Change::None) { checkChange({}); return; }
         status(QStringLiteral("자동 크로마키 필터가 꺼져 있습니다. 소스의 필터 목록에서 켜 주세요.")); return;
     }
-    const bool running = isVisible() || collecting_ || ready_;
-    requestCapture(filter_, running); driver_.setSource(running ? source_ : nullptr);
+    const bool running = isVisible() || collecting_ || ready_ || change_ != Change::None;
+    requestCapture(filter_, running, locked()); driver_.setSource(running ? source_ : nullptr);
     if (!running) return;
     if (!sceneTransformTimer_.isValid() || sceneTransformTimer_.elapsed() >= 250) {
         preview_->setSceneTransform(sourceTransform(source_)); sceneTransformTimer_.start();
     }
     auto p = readPreview(filter_);
+    if (change_ != Change::None) {
+        checkChange(p);
+        if (change_ != Change::None) return;
+    }
     if (!p.original.valid()) {
         if (collecting_ && ++collectedTicks_ > 250) { cancel(); status(QStringLiteral("10초 동안 화면을 읽지 못했습니다. 카메라 연결과 소스 표시를 확인하세요.")); }
         if (!p.error.empty()) status(utf8(p.error.c_str()));
@@ -715,7 +741,8 @@ void Dock::tick()
         if (collecting_ || analyzing_ || ready_) { cancel(); status(QStringLiteral("해상도가 바뀌었습니다. 자동 맞춤을 다시 실행하세요.")); }
     }
     width_ = p.original.width; height_ = p.original.height;
-    info_->setText(QStringLiteral("%1 · %2 × %3 · %4").arg(utf8(obs_source_get_name(source_))).arg(width_).arg(height_).arg(locked() ? QStringLiteral("송출 잠금") : QStringLiteral("준비 모드")));
+    info_->setText(QStringLiteral("%1 · %2 × %3 · %4").arg(utf8(obs_source_get_name(source_))).arg(width_).arg(height_).arg(
+        liveEditing() ? QStringLiteral("송출 중 · 수치 미리보기") : locked() ? QStringLiteral("송출 잠금") : QStringLiteral("준비 모드")));
     preview_->setFrames(p);
     if (!collecting_) return;
     if (uint64_t(p.original.rgba.size()) * required_ > 512ULL * 1024 * 1024) {
@@ -756,8 +783,9 @@ void Dock::finish()
     analyzing_ = false;
     if (shuttingDown_) return;
     progress_->setRange(0, 100); progress_->setValue(0);
+    if (workerGeneration_ != generation_) { updateButtons(); return; }
     auto result = watcher_.result();
-    if (workerGeneration_ != generation_ || !attached() || locked() || result.cancelled ||
+    if (!attached() || locked() || result.cancelled ||
         width_ != workerWidth_ || height_ != workerHeight_ ||
         (result.plate.valid() && (result.plate.width != width_ || result.plate.height != height_))) {
         status(QStringLiteral("분석 결과를 취소했습니다. 기존 설정은 유지됩니다.")); updateButtons(); return;
@@ -805,7 +833,8 @@ QJsonObject Dock::candidateSettings() const
 }
 void Dock::updateCandidate()
 {
-    if (loading_ || !filter_ || collecting_ || analyzing_ || locked()) return;
+    if (loading_ || !filter_ || collecting_ || analyzing_ || change_ != Change::None) return;
+    if (locked()) { updateLiveCandidate(); return; }
     if (!ready_) {
         const auto current = settingsJson(filter_);
         const auto method = current.value("method").toString();
@@ -815,8 +844,137 @@ void Dock::updateCandidate()
     auto *s = fromJson(candidateSettings()); setPreviewSettings(filter_, s); obs_data_release(s);
     updateButtons();
 }
+bool Dock::liveEditing() const
+{
+    return isLive() && !streamStarting_.load() && !recordStarting_.load() &&
+        filter_ && obs_source_enabled(filter_) && change_ == Change::None && !collecting_ && !analyzing_;
+}
+
+void Dock::updateLiveCandidate()
+{
+    if (!liveEditing() || !attached()) return;
+    const auto current = settingsJson(filter_);
+    const auto method = current.value("method").toString();
+    if (method != "color" && method != "plate" && method != "precision") return;
+    if (livePreviewRevision_ && current != liveBase_) {
+        cancel();
+        status(QStringLiteral("OBS에서 설정이 바뀌었습니다. 현재 송출값을 다시 불러왔습니다."));
+        return;
+    }
+    liveBase_ = current;
+    liveCandidate_ = current;
+    liveCandidate_["despill_strength"] = despill_->value();
+    if (method == "color") {
+        liveCandidate_["similarity"] = similarity_->value();
+        liveCandidate_["smoothness"] = smoothness_->value();
+    } else if (method == "plate") {
+        liveCandidate_["tau_cd"] = tau_->value();
+    } else {
+        liveCandidate_["precision_tolerance"] = precisionTolerance_->value();
+        liveCandidate_["precision_softness"] = precisionSoftness_->value();
+        liveCandidate_["precision_edge"] = precisionEdge_->value();
+        liveCandidate_["precision_feather"] = precisionFeather_->value();
+    }
+    auto *settings = fromJson(liveCandidate_);
+    livePreviewRevision_ = setPreviewSettings(filter_, settings);
+    obs_data_release(settings);
+    status(QStringLiteral("미리보기 조정 중 · 현재 송출값 유지. 새 화면 확인 후 적용하세요."));
+    updateButtons();
+}
+
+void Dock::applyLive()
+{
+    if (!liveEditing() || !attached() || !previewVerified(filter_, livePreviewRevision_)) return;
+    const auto current = settingsJson(filter_);
+    if (current != liveBase_) {
+        cancel();
+        status(QStringLiteral("OBS에서 설정이 바뀌었습니다. 현재 송출값을 다시 불러왔습니다."));
+        return;
+    }
+    liveUndo_ = current;
+    beginChange(Change::LiveApply, liveCandidate_, false);
+}
+
+void Dock::beginChange(Change change, QJsonObject settings, bool replace)
+{
+    change_ = change;
+    changeRequest_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    settings["ac_request_id"] = changeRequest_;
+    changeExpected_ = settings;
+    ready_ = false;
+    if (change == Change::LiveApply) liveApplied_ = settings;
+    livePreviewRevision_ = 0; liveBase_ = {}; liveCandidate_ = {};
+    setPreviewSettings(filter_, nullptr);
+    auto *data = fromJson(settings);
+    if (replace) obs_source_reset_settings(filter_, data);
+    else obs_source_update(filter_, data);
+    obs_data_release(data);
+    changeTimer_.start();
+    status(change == Change::Reset ? QStringLiteral("초기화 중 · 새 카메라 프레임 확인 대기")
+                                  : QStringLiteral("송출 설정 반영 확인 중…"));
+    updateButtons();
+}
+
+void Dock::checkChange(const Preview &preview)
+{
+    const auto request = changeRequest_.toStdString();
+    const bool applied = appliedRequest(filter_) == request;
+    const bool rendered = preview.appliedRequest == request && preview.original.valid() &&
+                          preview.processed.valid() && preview.error.empty();
+    if (!applied && changeTimer_.elapsed() >= 1000) {
+        auto *settings = obs_source_get_settings(filter_);
+        const bool stillRequested = request == obs_data_get_string(settings, "ac_request_id");
+        obs_data_release(settings);
+        if (!stillRequested) {
+            change_ = Change::None; changeRequest_.clear();
+            changeExpected_ = {};
+            loadControls();
+            status(QStringLiteral("반영 확인 중 OBS 설정이 바뀌었습니다. 현재 설정을 확인하세요."));
+            return;
+        }
+        status(QStringLiteral("영상 스레드에서 설정 반영을 확인하는 중…"));
+    }
+    if (!applied || !rendered || (change_ == Change::Reset && analyzing_)) {
+        if (changeTimer_.elapsed() >= 1000 && applied) {
+            if (change_ == Change::Reset) {
+                if (analyzing_)
+                    status(QStringLiteral("기본값 반영 완료 · 취소한 분석이 끝나기를 기다리는 중"));
+                else if (!preview.error.empty())
+                    status(QStringLiteral("기본값 반영 완료 · 영상 확인 대기. ") + utf8(preview.error.c_str()));
+                else
+                    status(QStringLiteral("설정 초기화 완료 · 카메라 화면 대기 중"));
+            } else if (!preview.error.empty()) {
+                change_ = Change::None; changeRequest_.clear();
+                changeExpected_ = {};
+                loadControls();
+                status(QStringLiteral("새 송출값의 영상 확인에 실패했습니다. ") + utf8(preview.error.c_str()));
+            }
+        }
+        return;
+    }
+    const auto completed = change_;
+    change_ = Change::None; changeRequest_.clear();
+    const bool settingsMatch = settingsJson(filter_) == changeExpected_;
+    changeExpected_ = {};
+    if (!settingsMatch) {
+        loadControls();
+        status(QStringLiteral("반영을 확인하는 동안 OBS 설정이 바뀌었습니다. 현재 설정을 확인하세요."));
+        return;
+    }
+    if (completed == Change::LiveRestore) { liveUndo_ = {}; liveApplied_ = {}; }
+    loadControls();
+    if (completed == Change::Reset) {
+        status(resetMissingKeyers_ ? QStringLiteral("초기화 완료 · 일부 이전 필터를 찾지 못했습니다. 자동 맞춤으로 다시 시작하세요.")
+                                   : QStringLiteral("초기화 완료 · 자동 맞춤을 눌러 다시 시작하세요."));
+    } else {
+        status(completed == Change::LiveRestore ? QStringLiteral("직전 송출값 복원 완료")
+                                                : QStringLiteral("송출값 적용 완료 · 직전 송출값을 복원할 수 있습니다."));
+    }
+}
+
 void Dock::apply()
 {
+    if (locked()) { applyLive(); return; }
     if (!ready_ || !writable()) return;
     auto obj = candidateSettings();
     const auto previous = settingsJson(filter_);
@@ -840,16 +998,9 @@ void Dock::apply()
     obs_source_set_enabled(filter_, true); setPreviewSettings(filter_, nullptr); ready_ = false; pendingPlate_.clear();
     loadControls(); status(QStringLiteral("적용했습니다. 기존 크로마키는 꺼 두었으며 ‘되돌리기’로 복원할 수 있습니다.")); updateButtons();
 }
-void Dock::revert(bool reset)
+bool Dock::restoreKeyers(const QJsonObject &settings)
 {
-    if (!attached()) return;
-    cancel(); const auto current = settingsJson(filter_);
-    const auto backup = current.value("ac_backup").toString();
-    if (backup.isEmpty()) {
-        if (reset) { obs_data_t *s = obs_data_create(); obs_data_set_string(s, "method", "passthrough"); obs_source_reset_settings(filter_, s); obs_data_release(s); loadControls(); }
-        status(QStringLiteral("복원할 적용 기록이 없습니다.")); return;
-    }
-    const auto keyers = QJsonDocument::fromJson(current.value("ac_disabled_keyers").toString().toUtf8()).array();
+    const auto keyers = QJsonDocument::fromJson(settings.value("ac_disabled_keyers").toString().toUtf8()).array();
     bool missing = false;
     for (const auto &entry : keyers) {
         const auto record = entry.toObject();
@@ -863,6 +1014,25 @@ void Dock::revert(bool reset)
         else obs_source_set_enabled(child, record["enabled"].toBool());
         if (child) obs_source_release(child);
     }
+    return missing;
+}
+
+void Dock::revert()
+{
+    if (!attached() || change_ != Change::None) return;
+    if (locked()) {
+        if (!liveEditing() || liveUndo_.isEmpty()) return;
+        if (settingsJson(filter_) != liveApplied_) {
+            status(QStringLiteral("OBS에서 설정이 바뀌어 직전 송출값을 적용할 수 없습니다."));
+            return;
+        }
+        beginChange(Change::LiveRestore, liveUndo_, true);
+        return;
+    }
+    cancel(); const auto current = settingsJson(filter_);
+    const auto backup = current.value("ac_backup").toString();
+    if (backup.isEmpty()) { status(QStringLiteral("복원할 적용 기록이 없습니다.")); return; }
+    const bool missing = restoreKeyers(current);
     auto original = QJsonDocument::fromJson(backup.toUtf8()).object();
     if (missing) { original["ac_backup"] = backup; original["ac_disabled_keyers"] = current["ac_disabled_keyers"]; }
     auto *s = fromJson(original); obs_source_reset_settings(filter_, s); obs_data_release(s); loadControls();
@@ -870,22 +1040,33 @@ void Dock::revert(bool reset)
 }
 void Dock::reset()
 {
-    if (!writable() || analyzing_) return;
-    const int dialogGeneration = generation_;
+    if (!writable() || change_ != Change::None) return;
+    const auto cameraId = utf8(obs_source_get_uuid(source_));
+    const auto filterId = utf8(obs_source_get_uuid(filter_));
     if (QMessageBox::question(this, QStringLiteral("자동 크로마키 초기화"),
-        QStringLiteral("자동 크로마키 설정을 초기화하고 기존 필터 상태를 복원할까요?\n촬영 원본과 다른 소스의 설정은 유지됩니다.")) != QMessageBox::Yes) return;
-    if (dialogGeneration != generation_ || !writable()) return;
-    revert(true);
-    auto *s = obs_source_get_settings(filter_);
-    const bool unresolved = *obs_data_get_string(s, "ac_backup") != '\0'; obs_data_release(s);
-    if (unresolved) return;
-    obs_source_filter_remove(source_, filter_); detach(); preview_->setFrames({});
-    sources_->setCurrentIndex(0); status(QStringLiteral("초기화했습니다. 소스를 다시 선택해 시작하세요.")); updateButtons();
+        QStringLiteral("선택한 카메라의 자동 크로마키 작업을 초기화할까요?\n진행 중인 분석을 취소하고 카메라 선택은 유지합니다.")) != QMessageBox::Yes) return;
+    if (!writable() || change_ != Change::None) return;
+    if (cameraId != utf8(obs_source_get_uuid(source_)) || filterId != utf8(obs_source_get_uuid(filter_))) {
+        status(QStringLiteral("확인 중 카메라 또는 필터가 바뀌었습니다. 대상을 확인하고 다시 초기화하세요."));
+        return;
+    }
+    const auto current = settingsJson(filter_);
+    cancel(false);
+    resetMissingKeyers_ = restoreKeyers(current);
+    liveUndo_ = {}; liveApplied_ = {};
+    preview_->setFrames({});
+    region_->setCurrentIndex(0);
+    views_->setCurrentIndex(1);
+    obs_source_set_enabled(filter_, true);
+    beginChange(Change::Reset, {{"method", "passthrough"}}, true);
+    loadControls();
 }
 void Dock::updateButtons()
 {
-    const bool busy = collecting_ || analyzing_, active = source_ && filter_;
+    const bool changing = change_ != Change::None;
+    const bool busy = collecting_ || analyzing_ || changing, active = source_ && filter_;
     const bool editable = active && !busy && !locked(), precision = engine_->currentIndex() == 1;
+    const bool live = active && liveEditing();
     std::string selectedMethod = ready_ ? pending_.method : "";
     bool manualPlate = false;
     if (filter_) {
@@ -896,9 +1077,15 @@ void Dock::updateButtons()
     }
     if (ready_ && pending_.strings.count("plate_kind")) manualPlate = pending_.strings.at("plate_kind") == "manual";
     const bool color = !precision && selectedMethod == "color", plate = !precision && selectedMethod == "plate";
-    sources_->setEnabled(!busy); automatic_->setEnabled(active && !busy && !locked());
-    plate_->setEnabled(active && !busy && !locked()); apply_->setEnabled(active && ready_ && !busy && !locked());
-    cancel_->setEnabled(busy || ready_); revert_->setEnabled(active && !analyzing_); reset_->setEnabled(active && !busy && !locked());
+    const bool livePrecision = live && selectedMethod == "precision";
+    sources_->setEnabled(!collecting_ && !analyzing_); automatic_->setEnabled(active && !busy && !locked());
+    plate_->setEnabled(active && !busy && !locked());
+    apply_->setText(locked() ? QStringLiteral("송출값 적용") : QStringLiteral("결과 적용"));
+    apply_->setEnabled((editable && ready_) || (live && previewVerified(filter_, livePreviewRevision_)));
+    cancel_->setEnabled(!changing && (busy || ready_ || livePreviewRevision_));
+    revert_->setText(locked() ? QStringLiteral("직전 송출값 복원") : QStringLiteral("되돌리기"));
+    revert_->setEnabled((active && !locked() && !analyzing_ && !changing) || (live && !liveUndo_.isEmpty()));
+    reset_->setEnabled(active && !changing && !locked());
     region_->setEnabled(!busy && !locked()); clearRegion_->setEnabled(!busy && !locked()); preview_->setEnabled(!busy && !locked());
     regionTool_->setEnabled(editable && region_->currentIndex() >= 2 && region_->currentIndex() <= 4);
     const int regionIndex = region_->currentIndex();
@@ -912,9 +1099,12 @@ void Dock::updateButtons()
     editStrokeScope_->setEnabled(editable && precision && selectedStroke >= 0 && selectedStroke < strokes_.size() && strokes_[selectedStroke].toObject()["local"].toBool());
     addStroke_->setEnabled(editable); excludeStroke_->setEnabled(editable); deleteStroke_->setEnabled(editable && precision && !strokes_.isEmpty());
     clearStrokes_->setEnabled(editable && precision && !strokes_.isEmpty()); undoStroke_->setEnabled(editable && precision && !strokeHistory_.empty());
-    similarity_->parentWidget()->setEnabled(editable && color); smoothness_->parentWidget()->setEnabled(editable && color);
-    despill_->parentWidget()->setEnabled(editable && (precision || color || plate)); tau_->parentWidget()->setEnabled(editable && plate);
-    for (auto *control : {precisionTolerance_, precisionSoftness_, precisionEdge_, precisionFeather_}) control->parentWidget()->setEnabled(editable && precision);
+    similarity_->parentWidget()->setEnabled((editable || live) && color);
+    smoothness_->parentWidget()->setEnabled((editable || live) && color);
+    despill_->parentWidget()->setEnabled((editable && precision) || livePrecision || ((editable || live) && (color || plate)));
+    tau_->parentWidget()->setEnabled((editable || live) && plate);
+    for (auto *control : {precisionTolerance_, precisionSoftness_, precisionEdge_, precisionFeather_})
+        control->parentWidget()->setEnabled((editable && precision) || livePrecision);
     despeck_->setEnabled(editable && plate && manualPlate);
 }
 void Dock::frontend(enum obs_frontend_event event, void *opaque)
@@ -929,8 +1119,17 @@ void Dock::frontend(enum obs_frontend_event event, void *opaque)
         if (self->shuttingDown_) return;
         if (event == OBS_FRONTEND_EVENT_EXIT) { self->shutdown(); return; }
         if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING || event == OBS_FRONTEND_EVENT_RECORDING_STARTING) {
-            if (self->collecting_ || self->analyzing_ || self->ready_) self->cancel();
-            self->status(QStringLiteral("방송·녹화가 시작되어 설정 변경을 잠갔습니다."));
+            if (self->collecting_ || self->analyzing_ || self->ready_ || self->livePreviewRevision_) self->cancel();
+            self->status(QStringLiteral("방송·녹화 시작 중 · 설정 적용 대기"));
+        }
+        if ((event == OBS_FRONTEND_EVENT_STREAMING_STARTED || event == OBS_FRONTEND_EVENT_RECORDING_STARTED) &&
+            self->liveEditing()) {
+            self->status(QStringLiteral("방송·녹화 중 · 수치는 미리보기로 조정할 수 있습니다."));
+        }
+        if ((event == OBS_FRONTEND_EVENT_STREAMING_STOPPED || event == OBS_FRONTEND_EVENT_RECORDING_STOPPED) &&
+            !self->locked()) {
+            if (self->livePreviewRevision_) self->cancel();
+            self->liveUndo_ = {}; self->liveApplied_ = {};
         }
         if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING) {
             self->cancel(); self->detach(); self->preview_->setFrames({});

@@ -355,9 +355,11 @@ void runTests(const QString &directory)
     obs_data_set_int(settings, "smoothness", 80);
     // The dock serializes user values; defaults are not present in this JSON.
     auto *serializedCandidate = obs_data_create_from_json(obs_data_get_json(settings));
-    ac::setPreviewSettings(test.filter, serializedCandidate);
+    const auto candidateRevision = ac::setPreviewSettings(test.filter, serializedCandidate);
     obs_data_release(serializedCandidate);
+    check(!ac::previewVerified(test.filter, candidateRevision), "candidate must render before it can be verified");
     p = test.wait();
+    check(ac::previewVerified(test.filter, candidateRevision), "rendered candidate confirms the exact revision");
     check(alphaAt(p.processed, 16, 0) && alphaAt(p.processed, 112, 255), "candidate removes background and keeps foreground");
     check(equalFrames(test.output, baseline), "candidate preview never changes committed output");
     const auto firstTime = p.original.timestamp;
@@ -367,6 +369,7 @@ void runTests(const QString &directory)
 
     obs_source_update(test.filter, settings);
     ac::setPreviewSettings(test.filter, nullptr);
+    check(!ac::previewVerified(test.filter, candidateRevision), "cleared candidate revision cannot be applied");
     p = test.wait();
     check(alphaAt(test.output, 16, 0) && alphaAt(test.output, 112, 255), "apply changes committed color-key output");
     check(colorAt(p.original, 16, 30, 180, 60, 255), "original capture stays unkeyed after apply");
@@ -451,6 +454,49 @@ void runTests(const QString &directory)
     }
     check(equalFrames(translucent.output, transparentBaseline), "passthrough preserves a partially transparent input");
     check(alphaAt(p.original, 16, 128) && alphaAt(p.processed, 16, 128), "readback retains partial input alpha");
+
+    Harness resetTest;
+    resetTest.draw();
+    const auto raw = resetTest.output;
+    resetTest.addFilter();
+    ac::requestCapture(resetTest.filter, true, true);
+    auto *before = obs_data_create();
+    obs_data_set_string(before, "method", "color");
+    obs_data_set_string(before, "ac_request_id", "live-apply");
+    obs_data_set_string(before, "precision_strokes", "[]");
+    setRect(before, "erase", 0, 0, 1, 1);
+    obs_source_update(resetTest.filter, before);
+    p = resetTest.wait();
+    check(p.appliedRequest == "live-apply" && ac::appliedRequest(resetTest.filter) == "live-apply" &&
+          alphaAt(resetTest.output, 112, 0), "rendered frame acknowledges applied settings");
+    auto *bad = obs_data_create();
+    obs_data_set_string(bad, "method", "plate");
+    obs_data_set_string(bad, "plate_path", "missing-live-candidate.png");
+    const auto badRevision = ac::setPreviewSettings(resetTest.filter, bad);
+    obs_data_release(bad);
+    p = resetTest.wait();
+    check(!p.error.empty() && !ac::previewVerified(resetTest.filter, badRevision) &&
+          alphaAt(resetTest.output, 112, 0), "failed preview cannot be verified and leaves committed output unchanged");
+    ac::setPreviewSettings(resetTest.filter, nullptr);
+    auto *defaults = obs_data_create();
+    obs_data_set_string(defaults, "method", "passthrough");
+    obs_data_set_string(defaults, "ac_request_id", "reset");
+    obs_source_reset_settings(resetTest.filter, defaults);
+    obs_data_release(defaults);
+    p = resetTest.wait();
+    check(p.appliedRequest == "reset" && ac::appliedRequest(resetTest.filter) == "reset" &&
+          p.error.empty() && equalFrames(resetTest.output, raw) && equalFrames(p.original, p.processed),
+          "in-place reset clears the mask and confirms the original output on the same filter");
+    auto *cleared = obs_source_get_settings(resetTest.filter);
+    check(!obs_data_has_user_value(cleared, "erase_w") && !obs_data_has_user_value(cleared, "precision_strokes"),
+          "in-place reset removes previously saved masks and stroke data");
+    obs_data_release(cleared);
+    ac::setPreviewSettings(resetTest.filter, nullptr);
+    obs_source_reset_settings(resetTest.filter, before);
+    obs_data_release(before);
+    p = resetTest.wait();
+    check(p.appliedRequest == "live-apply" && alphaAt(resetTest.output, 112, 0),
+          "restoring prior settings on the same filter acknowledges the restored output");
 }
 } // namespace
 

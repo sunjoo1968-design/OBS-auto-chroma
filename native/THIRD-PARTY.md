@@ -1,6 +1,6 @@
 # Third-party sources
 
-SunjooAn Auto Chroma v1.3
+SunjooAn Auto Chroma v1.4
 
 - The stroke precision model, GPU precision shader and dock controls are independent additions for this project. They do not include Blackmagic Design code or claim to reproduce DaVinci Resolve's proprietary algorithms.
 

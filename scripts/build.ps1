@@ -15,4 +15,4 @@ if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed' }
 & cmake --install $taskBuild --config $Configuration --prefix $taskPackage
 if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
-Write-Output "SunjooAn v1.3 OBS $ObsMajor package: $taskPackage"
+Write-Output "SunjooAn v1.4 OBS $ObsMajor package: $taskPackage"
