@@ -249,6 +249,55 @@ bool equalAlpha(const ac::Frame &a, const ac::Frame &b)
         if (!nearByte(a.rgba[i], b.rgba[i])) return false;
     return true;
 }
+void runStrokeOverlayTests()
+{
+    Harness test(false, true);
+    test.addFilter();
+    auto *base = obs_source_get_settings(test.filter);
+    obs_data_set_string(base, "method", "color");
+    obs_data_set_int(base, "key_color", 30 | (180 << 8) | (60 << 16));
+    obs_data_set_int(base, "similarity", 40);
+    obs_data_set_int(base, "smoothness", 80);
+    obs_source_update(test.filter, base);
+    const auto fitted = test.wait().processed;
+    check(pixel(fitted, 16, 24)[3] <= 2 && pixel(fitted, 16, 72)[3] > 128,
+          "basic fit keys the main background but leaves the second shade");
+    const auto fittedOutput = test.output;
+
+    auto *candidate = obs_data_create_from_json(obs_data_get_json(base));
+    setStrokes(candidate, {stroke(140, 230, 130, false, true)});
+    ac::setPreviewSettings(test.filter, candidate);
+    check(equalFrames(test.wait().processed, fitted), "legacy basic settings keep dormant stroke data dormant");
+    obs_data_set_bool(candidate, "ac_stroke_overlay", true);
+    ac::setPreviewSettings(test.filter, candidate);
+    const auto corrected = test.wait().processed;
+    bool keepsBaseAlpha = corrected.rgba.size() == fitted.rgba.size();
+    for (size_t i = 3; keepsBaseAlpha && i < corrected.rgba.size(); i += 4)
+        keepsBaseAlpha = corrected.rgba[i] <= int(fitted.rgba[i]) + 2;
+    check(keepsBaseAlpha && pixel(corrected, 16, 72)[3] <= 2 &&
+          pixel(corrected, 48, 72)[3] == pixel(fitted, 48, 72)[3],
+          "basic stroke corrects only its scope and never restores the original alpha");
+    check(equalFrames(test.output, fittedOutput), "stroke preview leaves the committed output unchanged");
+
+    obs_source_update(test.filter, candidate);
+    ac::setPreviewSettings(test.filter, nullptr);
+    ac::requestCapture(test.filter, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    test.draw();
+    check(pixel(test.output, 16, 24)[3] <= 2 && pixel(test.output, 16, 72)[3] <= 2 &&
+          pixel(test.output, 48, 72)[3] == pixel(fittedOutput, 48, 72)[3],
+          "applied stroke overlay works when the dock is closed");
+    setStrokes(candidate, {stroke(140, 230, 130, false, true), stroke(140, 230, 130, true)});
+    ac::requestCapture(test.filter, true);
+    ac::setPreviewSettings(test.filter, candidate);
+    check(equalAlpha(test.wait().processed, fitted), "exclude stroke cancels the added coverage without reviving fitted pixels");
+    setStrokes(candidate, {});
+    ac::setPreviewSettings(test.filter, candidate);
+    check(equalFrames(test.wait().processed, fitted), "deleting all extra strokes returns to the fitted result");
+    obs_data_release(candidate);
+    obs_data_release(base);
+}
+
 void runPrecisionTests()
 {
     Harness test(false, true);
@@ -547,7 +596,7 @@ int main(int argc, char **argv)
     }
     ac::registerFilter();
     registerSynthetic();
-    try { runTests(temporary.path()); runPrecisionTests(); }
+    try { runTests(temporary.path()); runPrecisionTests(); runStrokeOverlayTests(); }
     catch (const std::exception &error) { std::cerr << "FAIL " << error.what() << std::endl; ++failures; }
     obs_shutdown();
     testModule = nullptr;

@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace ac {
-inline constexpr const char *Version = "1.4";
+inline constexpr const char *Version = "1.4.1";
 inline constexpr const char *Author = "SunjooAn";
 inline constexpr const char *FilterId = "sunjoo_auto_chroma";
 struct Frame {

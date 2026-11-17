@@ -175,6 +175,7 @@ private:
     QListWidget *strokeList_;
     QPushButton *addStroke_, *excludeStroke_, *deleteStroke_, *undoStroke_, *clearStrokes_, *editStrokeScope_;
     QJsonArray strokes_;
+    bool strokeOverlay_ = false;
     std::vector<QJsonArray> strokeHistory_;
     int scopeEditStroke_ = -1;
     QTimer timer_;
@@ -341,11 +342,16 @@ Dock::Dock()
         const double percent = std::min(800., preview_->zoomPercent() * 1.2); preview_->setZoom(percent); preview_->zoomChanged(percent);
     });
     connect(fit, &QPushButton::clicked, this, [this] { zoom_->setCurrentIndex(0); preview_->setZoom(0); });
-    connect(engine_, &QComboBox::currentIndexChanged, this, [this] { if (!loading_) { scopeEditStroke_ = -1; preview_->cancelInteraction(); if (engine_->currentIndex() == 0 && region_->currentIndex() >= 5) region_->setCurrentIndex(0); updateCandidate(); updateButtons(); } });
+    connect(engine_, &QComboBox::currentIndexChanged, this, [this] {
+        if (loading_) return;
+        scopeEditStroke_ = -1;
+        preview_->cancelInteraction();
+        updateCandidate();
+        updateButtons();
+    });
     connect(region_, &QComboBox::currentIndexChanged, this, [this](int index) {
         scopeEditStroke_ = -1;
         editRegion_->setChecked(false);
-        if (index >= 5 && engine_->currentIndex() == 0) engine_->setCurrentIndex(1);
         preview_->setEditRegion(index);
         updateButtons();
     });
@@ -358,8 +364,8 @@ Dock::Dock()
         preview_->setExistingRegionEdit(enabled);
         if (enabled) status(QStringLiteral("윤곽 클릭으로 점 추가 · 점 선택 후 Delete · Alt+핸들 드래그로 한쪽 조절"));
     });
-    connect(addStroke_, &QPushButton::clicked, this, [this] { engine_->setCurrentIndex(1); region_->setCurrentIndex(5); });
-    connect(excludeStroke_, &QPushButton::clicked, this, [this] { engine_->setCurrentIndex(1); region_->setCurrentIndex(6); });
+    connect(addStroke_, &QPushButton::clicked, this, [this] { region_->setCurrentIndex(5); });
+    connect(excludeStroke_, &QPushButton::clicked, this, [this] { region_->setCurrentIndex(6); });
     connect(localStroke_, &QCheckBox::toggled, this, [this](bool checked) {
         if (checked && !loading_ && !local_.valid()) { region_->setCurrentIndex(4); status(QStringLiteral("국소 보정 범위를 그린 뒤 배경색 추가 스트로크를 선택하세요.")); }
     });
@@ -411,6 +417,7 @@ Dock::Dock()
             if (!local_.controls.anchors.isEmpty()) stroke["region_edit"] = encodeControls(local_.controls);
         }
         strokes_.append(stroke);
+        if (engine_->currentIndex() == 0) strokeOverlay_ = true;
         updateStrokeList(); updateCandidate();
         status(QStringLiteral("색 샘플을 추가했습니다. 알파와 머리카락 경계를 확인하고 결과 적용을 누르세요. 선을 더 그릴 수 있습니다."));
     };
@@ -541,6 +548,7 @@ void Dock::refreshSources()
 }
 void Dock::detach()
 {
+    strokeOverlay_ = false;
     change_ = Change::None; changeRequest_.clear();
     changeExpected_ = {};
     livePreviewRevision_ = 0; liveBase_ = {}; liveCandidate_ = {};
@@ -588,7 +596,7 @@ void Dock::loadControls()
     loading_ = true;
     auto *s = obs_source_get_settings(filter_);
     engine_->setCurrentIndex(std::string(obs_data_get_string(s, "method")) == "precision" ? 1 : 0);
-    if (engine_->currentIndex() == 0 && region_->currentIndex() >= 5) region_->setCurrentIndex(0);
+    strokeOverlay_ = obs_data_get_bool(s, "ac_stroke_overlay");
     similarity_->setValue(int(obs_data_get_int(s, "similarity"))); smoothness_->setValue(int(obs_data_get_int(s, "smoothness")));
     despill_->setValue(obs_data_get_double(s, "despill_strength")); tau_->setValue(obs_data_get_double(s, "tau_cd"));
     despeck_->setChecked(obs_data_get_bool(s, "despeck"));
@@ -817,6 +825,7 @@ QJsonObject Dock::candidateSettings() const
     obj["despill_strength"] = despill_->value(); obj["tau_cd"] = tau_->value();
     obj["despeck"] = despeck_->isChecked() && obj["method"].toString() == "plate" && obj["plate_kind"].toString() == "manual";
     obj["precision_strokes"] = QString::fromUtf8(QJsonDocument(strokes_).toJson(QJsonDocument::Compact));
+    obj["ac_stroke_overlay"] = strokeOverlay_;
     obj["precision_tolerance"] = precisionTolerance_->value(); obj["precision_softness"] = precisionSoftness_->value();
     obj["precision_edge"] = precisionEdge_->value(); obj["precision_feather"] = precisionFeather_->value();
     auto rect = [&obj](const char *prefix, Rect r) {
@@ -838,8 +847,12 @@ void Dock::updateCandidate()
     if (!ready_) {
         const auto current = settingsJson(filter_);
         const auto method = current.value("method").toString();
-        if (method != "color" && method != "plate" && method != "precision" && engine_->currentIndex() == 0) return;
-        pending_ = {}; pending_.success = true; pending_.method = (method == "precision" || method == "passthrough" || method.isEmpty()) ? "color" : method.toStdString(); ready_ = true;
+        if (method != "color" && method != "plate" && method != "precision" &&
+            engine_->currentIndex() == 0 && !strokeOverlay_) return;
+        pending_ = {};
+        pending_.success = true;
+        pending_.method = method == "precision" ? "color" : method.isEmpty() ? "passthrough" : method.toStdString();
+        ready_ = true;
     }
     auto *s = fromJson(candidateSettings()); setPreviewSettings(filter_, s); obs_data_release(s);
     updateButtons();
@@ -1078,6 +1091,7 @@ void Dock::updateButtons()
     if (ready_ && pending_.strings.count("plate_kind")) manualPlate = pending_.strings.at("plate_kind") == "manual";
     const bool color = !precision && selectedMethod == "color", plate = !precision && selectedMethod == "plate";
     const bool livePrecision = live && selectedMethod == "precision";
+    const bool editStrokes = editable && (precision || strokeOverlay_);
     sources_->setEnabled(!collecting_ && !analyzing_); automatic_->setEnabled(active && !busy && !locked());
     plate_->setEnabled(active && !busy && !locked());
     apply_->setText(locked() ? QStringLiteral("송출값 적용") : QStringLiteral("결과 적용"));
@@ -1094,17 +1108,17 @@ void Dock::updateButtons()
     if (!hasRegion) editRegion_->setChecked(false);
     editRegion_->setEnabled(editable && hasRegion);
     if (!editable) preview_->cancelInteraction();
-    engine_->setEnabled(editable); strokeList_->setEnabled(editable && precision); localStroke_->setEnabled(editable && precision);
+    engine_->setEnabled(editable); strokeList_->setEnabled(editable); localStroke_->setEnabled(editable);
     const int selectedStroke = strokeList_->currentRow();
-    editStrokeScope_->setEnabled(editable && precision && selectedStroke >= 0 && selectedStroke < strokes_.size() && strokes_[selectedStroke].toObject()["local"].toBool());
-    addStroke_->setEnabled(editable); excludeStroke_->setEnabled(editable); deleteStroke_->setEnabled(editable && precision && !strokes_.isEmpty());
-    clearStrokes_->setEnabled(editable && precision && !strokes_.isEmpty()); undoStroke_->setEnabled(editable && precision && !strokeHistory_.empty());
+    editStrokeScope_->setEnabled(editable && selectedStroke >= 0 && selectedStroke < strokes_.size() && strokes_[selectedStroke].toObject()["local"].toBool());
+    addStroke_->setEnabled(editable); excludeStroke_->setEnabled(editable); deleteStroke_->setEnabled(editable && !strokes_.isEmpty());
+    clearStrokes_->setEnabled(editable && !strokes_.isEmpty()); undoStroke_->setEnabled(editable && !strokeHistory_.empty());
     similarity_->parentWidget()->setEnabled((editable || live) && color);
     smoothness_->parentWidget()->setEnabled((editable || live) && color);
     despill_->parentWidget()->setEnabled((editable && precision) || livePrecision || ((editable || live) && (color || plate)));
     tau_->parentWidget()->setEnabled((editable || live) && plate);
     for (auto *control : {precisionTolerance_, precisionSoftness_, precisionEdge_, precisionFeather_})
-        control->parentWidget()->setEnabled((editable && precision) || livePrecision);
+        control->parentWidget()->setEnabled(editStrokes || livePrecision);
     despeck_->setEnabled(editable && plate && manualPlate);
 }
 void Dock::frontend(enum obs_frontend_event event, void *opaque)

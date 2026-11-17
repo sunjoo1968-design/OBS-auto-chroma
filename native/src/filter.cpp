@@ -26,6 +26,7 @@ struct Config {
     std::array<float, 9> rotation{1, 0, 0, 0, 1, 0, 0, 0, 1};
     float tauCd = 3, wCd = 1, tauLo = .55f, tauHi = 1.1f, wA = .05f;
     bool despeck = false;
+    bool strokeOverlay = false;
     PrecisionModel precision;
     float precisionTolerance = .025f, precisionSoftness = .06f, precisionEdge = .5f, precisionFeather = .02f;
     Region protect, erase;
@@ -49,6 +50,7 @@ struct Renderer {
     gs_texture_t *plate = nullptr;
     std::string platePath;
     gs_texrender_t *keyed = nullptr, *masked = nullptr, *straight = nullptr, *veto = nullptr;
+    gs_texrender_t *strokeResult = nullptr;
 };
 
 struct Stage {
@@ -127,6 +129,7 @@ Config readConfig(obs_data_t *s)
     c.protect = parseRegion(obs_data_get_string(s, "protect_points"), readRect(s, "protect"));
     c.erase = parseRegion(obs_data_get_string(s, "erase_points"), readRect(s, "erase"));
     c.precision = parsePrecisionModel(obs_data_get_string(s, "precision_strokes"), c.keyColor);
+    c.strokeOverlay = obs_data_get_bool(s, "ac_stroke_overlay");
     c.precisionTolerance = finiteClamp(obs_data_get_double(s, "precision_tolerance"), .005f, .30f, .025f);
     c.precisionSoftness = finiteClamp(obs_data_get_double(s, "precision_softness"), .005f, .30f, .06f);
     c.precisionEdge = finiteClamp(obs_data_get_double(s, "precision_edge"), 0, 1, .5f);
@@ -190,7 +193,7 @@ void colorParams(Filter *f, const Config &c)
     setVec3(e, "rot_b", c.rotation[6], c.rotation[7], c.rotation[8]);
 }
 
-void precisionParams(Filter *f, const Config &c)
+void precisionParams(Filter *f, const Config &c, bool overlay = false)
 {
     auto *e = f->precisionEffect;
     std::array<std::array<float, 4>, MaxPrecisionKeys> colors{}, rects{}, flags{};
@@ -207,6 +210,7 @@ void precisionParams(Filter *f, const Config &c)
         packOutline(vertices.data() + i * MaxRegionVertices, c.precision.outlines[i]);
     if (auto *p = gs_effect_get_param_by_name(e, "region_vertices")) gs_effect_set_val(p, vertices.data(), sizeof(vertices));
     setFloat(e, "key_count", float(c.precision.count));
+    setFloat(e, "first_key", overlay ? 1.f : 0.f);
     setFloat(e, "tolerance", c.precisionTolerance);
     setFloat(e, "softness", c.precisionSoftness);
     setFloat(e, "edge_strength", c.precisionEdge);
@@ -286,7 +290,7 @@ gs_texture_t *renderTo(gs_texrender_t *&target, uint32_t w, uint32_t h,
 void destroyRenderer(Renderer &r)
 {
     if (r.plate) gs_texture_destroy(r.plate);
-    for (auto *tr : {r.keyed, r.masked, r.straight, r.veto}) if (tr) gs_texrender_destroy(tr);
+    for (auto *tr : {r.keyed, r.masked, r.straight, r.veto, r.strokeResult}) if (tr) gs_texrender_destroy(tr);
     r = {};
 }
 
@@ -330,6 +334,12 @@ bool loadPlate(Renderer &r, const Config &c, uint32_t w, uint32_t h, std::string
         return false;
     }
     return true;
+}
+
+bool hasStrokeOverlay(const Config &config)
+{
+    return config.method != "precision" && config.strokeOverlay &&
+           (!config.precision.valid || config.precision.strokeCount != 0);
 }
 
 gs_texture_t *process(Filter *f, Renderer &r, const Config &c, gs_texture_t *raw, std::string &error)
@@ -382,6 +392,22 @@ gs_texture_t *process(Filter *f, Renderer &r, const Config &c, gs_texture_t *raw
         return raw;
     }
     if (!result) { error = "화면 처리용 GPU 텍스처를 만들지 못했습니다. 원본을 표시합니다."; return raw; }
+    if (hasStrokeOverlay(c)) {
+        if (!c.precision.valid) {
+            error = c.precision.error;
+        } else if (!f->precisionEffect) {
+            error = "스트로크 보정 GPU 엔진을 읽지 못했습니다. 기본 키잉 결과를 표시합니다.";
+        } else {
+            auto *corrected = renderTo(r.strokeResult, f->width, f->height, [&] {
+                precisionParams(f, c, true);
+                setTexture(f->precisionEffect, "image", raw);
+                setTexture(f->precisionEffect, "base_image", result);
+                draw(f->precisionEffect, "AddStrokes", raw, f->width, f->height);
+            });
+            if (corrected) result = corrected;
+            else error = "스트로크 보정에 실패했습니다. 기본 키잉 결과를 표시합니다.";
+        }
+    }
     if (c.protect.valid() || c.erase.valid()) {
         auto *masked = renderTo(r.masked, f->width, f->height, [&] {
             setTexture(f->maskEffect, "image", result);
@@ -504,10 +530,11 @@ void render(void *data, gs_effect_t *)
         f->shared->preview = {};
     }
     if (!capture && (f->lastCapture || f->stages[0].original)) clearStages(f);
-    if (!previewConfig && (f->candidate.plate || f->candidate.keyed)) destroyRenderer(f->candidate);
+    if (!previewConfig && (f->candidate.plate || f->candidate.keyed || f->candidate.masked || f->candidate.strokeResult))
+        destroyRenderer(f->candidate);
     const bool masked = config.protect.valid() || config.erase.valid();
     // With the dock preview closed, use the original one-pass path whenever possible.
-    if (!capture && !masked) {
+    if (!capture && !masked && !hasStrokeOverlay(config)) {
         if (config.method.empty() || config.method == "passthrough") {
             obs_source_skip_video_filter(f->context);
             publishError(f, captureLimitError);

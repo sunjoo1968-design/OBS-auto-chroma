@@ -2,10 +2,12 @@
 // Independent bounded multi-sample keyer; legacy v0.3 effects are unchanged.
 uniform float4x4 ViewProj;
 uniform texture2d image;
+uniform texture2d base_image;
 uniform float4 key_colors[32];
 uniform float4 key_rects[32];
 uniform float4 key_flags[32];
 uniform float key_count;
+uniform float first_key;
 uniform float tolerance;
 uniform float softness;
 uniform float feather;
@@ -72,14 +74,14 @@ float3 ReadStraight(float2 uv)
     float4 c = image.Sample(linearSampler, uv);
     return ToNonlinear(c.a > 0.000001 ? c.rgb / c.a : float3(0.0, 0.0, 0.0));
 }
-float4 PSPrecision(VertData v) : TARGET
+float4 ProcessPrecision(VertData v, bool overlay)
 {
     float4 raw = image.Sample(linearSampler, v.uv);
     float3 color = ToNonlinear(raw.a > 0.000001 ? raw.rgb / raw.a : float3(0.0, 0.0, 0.0));
     float scopes[32];
     int lastOutline = -1;
     float lastWeight = 0.0;
-    for (int i = 0; i < 32; ++i) {
+    for (int i = int(first_key); i < 32; ++i) {
         if (float(i) >= key_count) break;
         float4 flags = key_flags[i];
         if (flags.w < 3.0) {
@@ -110,7 +112,7 @@ float4 PSPrecision(VertData v) : TARGET
         float2 chroma = Chroma(sampleColor);
         float coverage = 1.0;
         float keep = 0.0;
-        for (int k = 0; k < 32; ++k) {
+        for (int k = int(first_key); k < 32; ++k) {
             if (float(k) >= key_count) break;
             // Neighbor samples share the output pixel's scope, preventing mask bleed.
             float scope = scopes[k];
@@ -131,6 +133,10 @@ float4 PSPrecision(VertData v) : TARGET
         maxAlpha = max(maxAlpha, result);
     }
     alpha = lerp(alpha, (alpha + neighbor) / (1.0 + neighborWeight), edge_strength * 0.2);
+    if (overlay) {
+        // Stroke coverage can only remove opacity from the original keying result.
+        return base_image.Sample(linearSampler, v.uv) * saturate(alpha);
+    }
     float edge = saturate((maxAlpha - minAlpha) * 3.0 + 4.0 * alpha * (1.0 - alpha));
     float best = 1000.0;
     float exclusion = 0.0;
@@ -174,6 +180,17 @@ float4 PSPrecision(VertData v) : TARGET
     float a = alpha * raw.a * opacity;
     return float4(linearColor * a, a);
 }
+float4 PSPrecision(VertData v) : TARGET
+{
+    return ProcessPrecision(v, false);
+}
+float4 PSAddStrokes(VertData v) : TARGET
+{
+    return ProcessPrecision(v, true);
+}
 technique Draw {
     pass { vertex_shader = VSDefault(v); pixel_shader = PSPrecision(v); }
+}
+technique AddStrokes {
+    pass { vertex_shader = VSDefault(v); pixel_shader = PSAddStrokes(v); }
 }
